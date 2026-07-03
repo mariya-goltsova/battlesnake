@@ -1,57 +1,107 @@
-# Battlesnake ML Inference Bot
+# Battlesnake Hybrid Bot (algo + ml)
 
-A [Battlesnake](https://play.battlesnake.com) written in Python and Flask. This
-version uses a pretrained model checkpoint to choose moves.
+Гибридный [Battlesnake](https://play.battlesnake.com)-бот на Python/Flask.
+Форк [Alex2034/battlesnake-public (ветка ml)](https://github.com/Alex2034/battlesnake-public/tree/ml);
+ниже описаны все изменения относительно этой исходной версии.
 
-## What It Does
+**Идея гибрида:** жёсткие правила безопасности (из ветки algo) → ML-ранжирование
+только безопасных ходов (из ветки ml). Правила гарантируют, что заведомо
+смертельный ход не будет выбран, пока есть альтернатива; модель выбирает лучший
+из выживающих. Стратегия: `unite_algo_ml.txt`, план работ: `docs/plans/stage0-hybrid-core.md`.
 
-Each turn, `logic.py`:
+## Что изменилось относительно исходной версии (ветка ml)
 
-- Gets legal moves for the current board.
-- Calculates per-move features.
-- Scores each move with a pure-Python linear model.
-- Returns the highest-scoring move.
+Исходная версия — один файл `logic.py`: эвристика + встроенная линейная модель,
+у обеих три системные ошибки, которые исправлены в этом форке.
 
+### Исправленные ошибки исходной версии
 
-## Files
+| # | Было (исходный `logic.py`) | Стало |
+|---|---|---|
+| 1 | **Статичная занятость**: хвосты всех змей считались вечно занятыми — бот «не видел» проходы, открывающиеся на следующем тике, и сам себя запирал | `sim.py`: симуляция следующего состояния — хвост освобождается, если змея не ест; при еде змея растёт; учтён «сдвоенный хвост» (`body[-1] == body[-2]` один тик после еды); хвост врага остаётся, если враг может съесть еду |
+| 2 | **Еда по Manhattan**: бот «видел» еду сквозь стены из тел и шёл к недостижимой еде | `features.py`: расстояния до еды по BFS по симулированной карте; недостижимая еда даёт `food_reachable = 0` и не притягивает |
+| 3 | **Head-to-head как мягкий вес** (штраф/коэффициент): большой Voronoi мог перевесить и увести под лобовое с более длинной змеёй | `safety.py`: **жёсткое вето** — клетка рядом с головой равной/большей змеи исключается из кандидатов, пока есть альтернатива; если альтернатив нет, ничья предпочитается проигрышу |
 
-- `backend.py` — Battlesnake HTTP server with `/`, `/start`, `/move`, and `/end`.
-- `logic.py` — embedded checkpoint, feature extraction, move scoring, and fallback logic.
-- `requirements.txt` — runtime dependencies.
-- `render.yaml` — Render deployment config.
+### Новая архитектура (pipeline вместо монолита)
 
-## Run Locally
+```
+Battlesnake request
+      ↓
+logic.choose_move (тонкая обёртка + heuristic fallback на исключение)
+      ↓
+policy.choose_move:
+    hard_safety_filter (safety.py)     — стены/тела/вето h2h
+      ↓
+    simulate_after_move (sim.py)       — корректная карта следующего тика
+      ↓
+    candidate_features (features.py)   — 13 фич модели + BFS-еда
+      ↓
+    линейная модель (веса исходной ml-версии, без изменений)
+      ↓
+    least_deadly fallback              — если безопасных ходов нет
+```
+
+### Файлы
+
+Новые модули (все — чистый Python, stdlib):
+
+- `core.py` — общие примитивы: `DIRECTIONS`, BFS, flood fill, занятость, h2h-клетки.
+- `sim.py` — симуляция следующего состояния (`simulate_after_move`, `blocked_for_legality`).
+- `safety.py` — `legal_moves` (с учётом освобождающихся хвостов) и `hard_safety_filter` (h2h-вето).
+- `features.py` — единая функция фич для serve и будущего обучения (паритет train↔serve); 13 имён фич модели сохранены, добавлены `bfs_food_dist`, `food_reachable`.
+- `policy.py` — сборка конвейера + встроенная модель (веса перенесены из `logic.py` без изменений) + `least_deadly`.
+- `engine.py` — минимальный движок официальных правил для локальных игр (сид, порядок хода: move → health → feed → spawn → eliminate; причины смерти).
+- `arena.py` — харнесс: N игр политика-vs-политика, win-rate, причины смерти, latency p50/p95.
+- `tests/` — 51 тест (pytest): примитивы, симуляция хвостов, канонические состояния поля (стена, свой хвост, сдвоенный хвост, h2h длиннее/короче, тупик, ловушка), фичи, конвейер, движок, арена.
+- `docs/plans/stage0-hybrid-core.md`, `*_improveness.txt` — план и стратегия.
+
+Изменённые:
+
+- `logic.py` — теперь тонкая обёртка: `get_info` + `choose_move → policy.choose_move`
+  с жадной эвристикой как последним fallback (сбой конвейера никогда не роняет игру).
+- `backend.py` — без изменений (те же 4 эндпоинта).
+
+### Результаты (arena, сеяные игры 11×11)
+
+Гибрид против исходной эвристики (100 игр, чередование стартовых позиций):
+
+| Метрика | algo (исходная эвристика) | hybrid (этот форк) |
+|---|---|---|
+| Победы | 7 | **92** (+1 ничья) |
+| Причины смерти | wall=21, self=20, h2h=39, body=12, starvation=1 | h2h=3, self=1, starvation=4 |
+| Latency p50 / p95 | 0.03 / 0.06 ms | 2.3 / 2.5 ms (бюджет 500 ms) |
+
+Solo-выживаемость: 4 из 5 сидов — полные 500 тиков (1 голодная смерть на 167-м —
+известная зона калибровки, см. «Дальше»).
+
+Воспроизвести: `python3 arena.py --a algo --b hybrid --games 100 --seed 100`
+
+## Запуск
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-.venv/bin/python backend.py
+.venv/bin/python backend.py            # сервер на :8000
 ```
 
-Test your battlesnake with the Battlesnake CLI:
+Тесты и локальные матчи (без Battlesnake CLI и HTTP):
 
 ```bash
-battlesnake play -W 11 -H 11 \
-  -n ml -u http://localhost:8000 \
-  -g solo \
-  -v -c -d 300
+python3 -m pytest tests/ -q            # 51 тест
+python3 arena.py --a algo --b hybrid --games 100 [--json out.json]
 ```
 
-## Deploy to Render
+## Деплой на Render
 
-1. Push this repo to GitHub.
-2. In the [Render dashboard](https://dashboard.render.com): **New -> Blueprint**,
-   connect the repo. Render reads `render.yaml` and provisions a free web
-   service running `gunicorn backend:app`.
-   - Or **New -> Web Service** manually with build command
-     `pip install -r requirements.txt` and start command
-     `gunicorn backend:app --bind 0.0.0.0:$PORT`.
-3. Wait for the deploy to go live. Note the public URL, e.g.
-   `https://battlesnake-xxxx.onrender.com`.
-4. Visit that URL in a browser — you should see the appearance JSON.
+Без изменений относительно исходной версии: **New → Blueprint** на этот репозиторий
+(`render.yaml`), либо вручную web-service с командой `gunicorn backend:app --bind 0.0.0.0:$PORT`.
+Публичный URL сервиса указывается при создании змейки на
+[play.battlesnake.com](https://play.battlesnake.com).
 
-## Register on Battlesnake
+## Дальше (Этапы 1–2 из unite_algo_ml.txt)
 
-1. Create an account at [play.battlesnake.com](https://play.battlesnake.com).
-2. **Create Battlesnake** -> paste your Render URL as the server URL.
-3. Now you can use it in a game!
+- Переобучение весов на корректных фичах: `train.py` + self-play датасет через
+  `engine.py` (веса модели пока исходные — считались на старых фичах).
+- Калибровка пищевой экономики (редкие голодные смерти при большой длине).
+- 2-ply lookahead поверх safety-фильтра.
+- Новые фичи: enemy-race-to-food, choke points, length advantage.
