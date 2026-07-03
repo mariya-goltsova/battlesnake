@@ -1,5 +1,0 @@
-pytest>=8
-numpy>=2
-cma>=3.3
-flask>=3
-requests>=2
